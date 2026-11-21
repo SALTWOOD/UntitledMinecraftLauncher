@@ -7,6 +7,8 @@ using UML.Core;
 using UML.Core.App;
 using UML.Core.Authentication;
 using UML.Core.Authentication.Microsoft;
+using UML.Core.Configuration;
+using UML.Core.Minecraft;
 using UML.Core.Profile;
 
 namespace UML.Cli;
@@ -98,10 +100,10 @@ internal static class Program
         remove.SetAction(async (parseResult, cancellationToken) =>
             await RemoveAsync(parseResult.GetValue(removeTarget)!, cancellationToken));
 
-        var select = new Command("select", "Select the current profile");
+        var selectProfile = new Command("select", "Select the current profile");
         var selectTarget = new Argument<string>("target") { Description = "Profile UUID, account id or username" };
-        select.Arguments.Add(selectTarget);
-        select.SetAction(async (parseResult, cancellationToken) =>
+        selectProfile.Arguments.Add(selectTarget);
+        selectProfile.SetAction(async (parseResult, cancellationToken) =>
             await SelectAsync(parseResult.GetValue(selectTarget)!, cancellationToken));
 
         var list = new Command("list", "List profiles");
@@ -109,14 +111,77 @@ internal static class Program
 
         profile.Subcommands.Add(add);
         profile.Subcommands.Add(remove);
-        profile.Subcommands.Add(select);
+        profile.Subcommands.Add(selectProfile);
         profile.Subcommands.Add(list);
+
+        var minecraft = new Command("minecraft", "Manage vanilla Minecraft instances");
+
+        var minecraftList = new Command("list", "List installed versions");
+        minecraftList.SetAction(_ => ListMinecraftVersions());
+
+        var minecraftInstall = new Command("install", "Install a vanilla version");
+        var installArgument = new Argument<string>("version") { Description = "Version id" };
+        minecraftInstall.Arguments.Add(installArgument);
+        minecraftInstall.SetAction(async (parseResult, cancellationToken) =>
+            await InstallMinecraftAsync(parseResult.GetValue(installArgument)!, cancellationToken));
+
+        var minecraftRemove = new Command("remove", "Remove an installed version");
+        var minecraftRemoveArgument = new Argument<string>("version") { Description = "Version id" };
+        minecraftRemove.Arguments.Add(minecraftRemoveArgument);
+        minecraftRemove.SetAction(async (parseResult, cancellationToken) =>
+            await RemoveMinecraftAsync(parseResult.GetValue(minecraftRemoveArgument)!, cancellationToken));
+
+        minecraft.Subcommands.Add(minecraftList);
+        minecraft.Subcommands.Add(minecraftInstall);
+        minecraft.Subcommands.Add(minecraftRemove);
+
+        var launch = new Command("launch", "Launch the selected Minecraft instance");
+        var dryRun = new Option<bool>("--dry-run", "-n")
+        {
+            Description = "Print the command without starting the game"
+        };
+        var log = new Option<bool>("--log", "-l")
+        {
+            Description = "Stream the game's stdout/stderr and wait for it to exit"
+        };
+        launch.Options.Add(dryRun);
+        launch.Options.Add(log);
+        launch.SetAction(async (parseResult, cancellationToken) =>
+            await LaunchAsync(
+                parseResult.GetValue(dryRun),
+                parseResult.GetValue(log),
+                cancellationToken));
+
+        var select = new Command("select", "Select the Minecraft folder or instance");
+        var versionArgument = new Argument<string>("version")
+        {
+            Description = "Installed version id",
+            Arity = ArgumentArity.ZeroOrOne
+        };
+        select.Arguments.Add(versionArgument);
+        select.SetAction(async (parseResult, cancellationToken) =>
+        {
+            var version = parseResult.GetValue(versionArgument);
+            return string.IsNullOrWhiteSpace(version)
+                ? ShowMinecraftSelection()
+                : await SelectMinecraftVersionAsync(version, cancellationToken);
+        });
+
+        var folder = new Command("folder", "Select the .minecraft folder");
+        var folderArgument = new Argument<string>("path") { Description = "Path to the .minecraft folder" };
+        folder.Arguments.Add(folderArgument);
+        folder.SetAction(async (parseResult, cancellationToken) =>
+            await SelectMinecraftFolderAsync(parseResult.GetValue(folderArgument)!, cancellationToken));
+        select.Subcommands.Add(folder);
 
         var exit = new Command("exit", "Exit the CLI");
         exit.Aliases.Add("quit");
         exit.SetAction(_ => _exitRequested = true);
 
         root.Subcommands.Add(profile);
+        root.Subcommands.Add(minecraft);
+        root.Subcommands.Add(launch);
+        root.Subcommands.Add(select);
         root.Subcommands.Add(exit);
 
         return root;
@@ -258,6 +323,337 @@ internal static class Program
         return 0;
     }
 
+    private static string GetMinecraftDirectory()
+    {
+        if (!string.IsNullOrWhiteSpace(Config.MinecraftDirectory))
+            return Config.MinecraftDirectory!;
+
+        var directory = MinecraftInstanceStore.DefaultDirectory;
+        Config.MinecraftDirectory = directory;
+        return directory;
+    }
+
+    private static async Task<int> SelectMinecraftFolderAsync(string path, CancellationToken cancellationToken)
+    {
+        string directory;
+
+        try
+        {
+            directory = Path.GetFullPath(path.Trim());
+            Directory.CreateDirectory(directory);
+        }
+        catch (Exception exception)
+            when (exception is ArgumentException
+                      or IOException
+                      or UnauthorizedAccessException
+                      or NotSupportedException)
+        {
+            Error(exception.Message);
+            return 1;
+        }
+
+        Config.MinecraftDirectory = directory;
+        await ConfigService.Current.FlushAsync(cancellationToken);
+        Console.WriteLine($"Minecraft folder: {directory}");
+        return 0;
+    }
+
+    private static async Task<int> SelectMinecraftVersionAsync(string id, CancellationToken cancellationToken)
+    {
+        var directory = GetMinecraftDirectory();
+        var store = new MinecraftInstanceStore(directory);
+
+        try
+        {
+            if (!store.IsInstalled(id))
+            {
+                Error($"Version '{id}' is not installed in {directory}.");
+                return 1;
+            }
+        }
+        catch (ArgumentException exception)
+        {
+            Error(exception.Message);
+            return 1;
+        }
+
+        Config.MinecraftVersion = id;
+        await ConfigService.Current.FlushAsync(cancellationToken);
+        Console.WriteLine($"Selected Minecraft version: {id}");
+        return 0;
+    }
+
+    private static int ShowMinecraftSelection()
+    {
+        var directory = GetMinecraftDirectory();
+        var version = Config.MinecraftVersion;
+
+        Console.WriteLine($"Minecraft folder: {directory}");
+        Console.WriteLine($"Minecraft version: {(string.IsNullOrWhiteSpace(version) ? "none" : version)}");
+        return 0;
+    }
+
+    private static int ListMinecraftVersions()
+    {
+        var directory = GetMinecraftDirectory();
+        var store = new MinecraftInstanceStore(directory);
+        var versions = store.GetVersions();
+
+        if (versions.Count == 0)
+        {
+            Console.WriteLine($"No versions installed in {directory}.");
+            return 0;
+        }
+
+        var selected = Config.MinecraftVersion;
+
+        Console.WriteLine($"{"VERSION",-24}  {"TYPE",-10}  {"INHERITS",-18}  CURRENT");
+        foreach (var version in versions)
+        {
+            var marker = string.Equals(version.Name, selected, StringComparison.Ordinal) ? "*" : "";
+            Console.WriteLine(
+                $"{version.Name,-24}  {version.Type ?? "?",-10}  {version.InheritsFrom ?? "",-18}  {marker}");
+        }
+
+        return 0;
+    }
+
+    private static async Task<int> InstallMinecraftAsync(string id, CancellationToken cancellationToken)
+    {
+        var directory = GetMinecraftDirectory();
+        var store = new MinecraftInstanceStore(directory);
+        var installer = new VanillaMinecraftInstaller(
+            store,
+            new MinecraftDownloader(new OfficialMinecraftSource()));
+
+        try
+        {
+            Console.WriteLine($"Installing {id} into {directory}...");
+            await installer.InstallAsync(id, new ConsoleProgress(), cancellationToken);
+
+            Config.MinecraftVersion = id;
+            await ConfigService.Current.FlushAsync(cancellationToken);
+
+            Console.WriteLine($"Installed and selected {id}.");
+            return 0;
+        }
+        catch (Exception exception)
+            when (exception is HttpRequestException
+                      or IOException
+                      or KeyNotFoundException
+                      or NotSupportedException
+                      or InvalidOperationException
+                      or ArgumentException)
+        {
+            Error(exception.GetBaseException().Message);
+            return 1;
+        }
+    }
+
+    private static async Task<int> RemoveMinecraftAsync(string id, CancellationToken cancellationToken)
+    {
+        var directory = GetMinecraftDirectory();
+        var store = new MinecraftInstanceStore(directory);
+
+        try
+        {
+            if (!store.Remove(id))
+            {
+                Error($"Version '{id}' is not installed in {directory}.");
+                return 1;
+            }
+
+            if (string.Equals(Config.MinecraftVersion, id, StringComparison.Ordinal))
+            {
+                Config.MinecraftVersion = null;
+                await ConfigService.Current.FlushAsync(cancellationToken);
+            }
+
+            Console.WriteLine($"Removed {id}.");
+            return 0;
+        }
+        catch (Exception exception)
+            when (exception is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            Error(exception.Message);
+            return 1;
+        }
+    }
+
+    private static async Task<int> LaunchAsync(
+        bool dryRun,
+        bool log,
+        CancellationToken cancellationToken)
+    {
+        var directory = GetMinecraftDirectory();
+        var versionId = Config.MinecraftVersion;
+
+        if (string.IsNullOrWhiteSpace(versionId))
+        {
+            Error("No Minecraft version selected. Use 'select <version>'.");
+            return 1;
+        }
+
+        var store = new MinecraftInstanceStore(directory);
+
+        MinecraftVersionDetail? version;
+        try
+        {
+            version = store.GetVersion(versionId);
+        }
+        catch (ArgumentException exception)
+        {
+            Error(exception.Message);
+            return 1;
+        }
+
+        if (version is null)
+        {
+            Error($"Version '{versionId}' is not installed in {directory}.");
+            return 1;
+        }
+
+        var profile = ProfileManager.Current.CurrentProfile;
+        if (profile is null)
+        {
+            Error("No profile selected. Use 'profile select <id>'.");
+            return 1;
+        }
+
+        var options = CreateLaunchOptions(directory, profile, out var warning);
+        if (options is null) return 1;
+        if (warning is not null) Console.Error.WriteLine("warning: " + warning);
+
+        try
+        {
+            var command = new MinecraftLauncher().Build(version, options);
+
+            if (dryRun)
+            {
+                Console.WriteLine(command.ToDisplayString());
+                return 0;
+            }
+
+            using var process = MinecraftLauncher.Start(command, redirectOutput: log);
+            Console.WriteLine(
+                log
+                    ? $"Launched {versionId} (PID {process.Id}). Streaming logs, press Ctrl+C to stop waiting..."
+                    : $"Launched {versionId} (PID {process.Id}).");
+
+            if (!log) return 0;
+
+            process.OutputDataReceived += (_, eventArgs) =>
+            {
+                if (eventArgs.Data is not null) Console.WriteLine(eventArgs.Data);
+            };
+            process.ErrorDataReceived += (_, eventArgs) =>
+            {
+                if (eventArgs.Data is not null) Console.Error.WriteLine(eventArgs.Data);
+            };
+
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+
+            try
+            {
+                await process.WaitForExitAsync(cancellationToken);
+                process.WaitForExit();
+            }
+            catch (OperationCanceledException)
+            {
+                return 130;
+            }
+
+            Console.WriteLine($"Minecraft exited with code {process.ExitCode}.");
+            return process.ExitCode;
+        }
+        catch (Exception exception)
+            when (exception is InvalidOperationException
+                      or InvalidDataException
+                      or NotSupportedException
+                      or System.ComponentModel.Win32Exception)
+        {
+            Error(exception.GetBaseException().Message);
+            return 1;
+        }
+    }
+
+    private static MinecraftLaunchOptions? CreateLaunchOptions(
+        string directory,
+        UserProfile profile,
+        out string? warning)
+    {
+        warning = null;
+        var launcherVersion = GetVersion();
+
+        switch (profile)
+        {
+            case MicrosoftProfile microsoft:
+                if (string.IsNullOrWhiteSpace(microsoft.Tokens.MinecraftAccessToken))
+                {
+                    Error("The selected Microsoft profile has no Minecraft access token.");
+                    return null;
+                }
+
+                if (microsoft.Tokens.MinecraftExpiresAt <= DateTimeOffset.UtcNow)
+                    warning = "The Minecraft access token has expired; re-run 'profile add microsoft' if launch fails.";
+
+                return new MinecraftLaunchOptions
+                {
+                    GameDirectory = directory,
+                    UserName = microsoft.Username,
+                    Uuid = microsoft.Uuid,
+                    AccessToken = microsoft.Tokens.MinecraftAccessToken,
+                    UserType = "msa",
+                    LauncherVersion = launcherVersion
+                };
+
+            case OfflineProfile offline:
+                return new MinecraftLaunchOptions
+                {
+                    GameDirectory = directory,
+                    UserName = offline.Username,
+                    Uuid = offline.Uuid,
+                    AccessToken = "0",
+                    UserType = "legacy",
+                    LauncherVersion = launcherVersion
+                };
+
+            default:
+                Error("The selected profile cannot launch the game.");
+                return null;
+        }
+    }
+
+    private sealed class ConsoleProgress : IProgress<MinecraftInstallProgress>
+    {
+        private readonly Lock _gate = new();
+        private string? _stage;
+
+        public void Report(MinecraftInstallProgress value)
+        {
+            lock (_gate)
+            {
+                if (_stage != value.Stage)
+                {
+                    if (_stage is not null) Console.WriteLine();
+                    _stage = value.Stage;
+                }
+
+                if (value.Total == 0)
+                {
+                    Console.WriteLine($"{value.Stage}: nothing to download");
+                    return;
+                }
+
+                Console.Write(
+                    $"\r{value.Stage,-10} {value.Completed,5}/{value.Total,-5} {value.Percent,6:P0}");
+
+                if (value.Completed >= value.Total) Console.WriteLine();
+            }
+        }
+    }
+
     private static UserProfile? ResolveProfile(string target)
     {
         var manager = ProfileManager.Current;
@@ -306,6 +702,11 @@ internal static class Program
         Console.WriteLine($"Config: {globalPath}");
         Console.WriteLine($"        {localPath}");
         Console.WriteLine($"Profiles: {manager.Profiles.Count}, selected: {currentText}");
+        Console.WriteLine(
+            $"Minecraft: {Config.MinecraftVersion ?? "none"} @ " +
+            (string.IsNullOrWhiteSpace(Config.MinecraftDirectory)
+                ? MinecraftInstanceStore.DefaultDirectory + " (default)"
+                : Config.MinecraftDirectory));
         Console.WriteLine(
             "Microsoft client id: " +
             (string.IsNullOrWhiteSpace(Secrets.MicrosoftClientId)

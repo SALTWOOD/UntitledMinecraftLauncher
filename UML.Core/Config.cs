@@ -26,4 +26,22 @@ public static partial class Config
         get => ConfigService.Current.Get(SelectedProfileKey);
         set => ConfigService.Current.Set(SelectedProfileKey, value);
     }
+
+    public static readonly ConfigKey<string?> MinecraftDirectoryKey =
+        new ConfigKey<string?>("minecraft.directory", null, ConfigLayer.Local);
+
+    public static string? MinecraftDirectory
+    {
+        get => ConfigService.Current.Get(MinecraftDirectoryKey);
+        set => ConfigService.Current.Set(MinecraftDirectoryKey, value);
+    }
+
+    public static readonly ConfigKey<string?> MinecraftVersionKey =
+        new ConfigKey<string?>("minecraft.version", null, ConfigLayer.Local);
+
+    public static string? MinecraftVersion
+    {
+        get => ConfigService.Current.Get(MinecraftVersionKey);
+        set => ConfigService.Current.Set(MinecraftVersionKey, value);
+    }
 }
