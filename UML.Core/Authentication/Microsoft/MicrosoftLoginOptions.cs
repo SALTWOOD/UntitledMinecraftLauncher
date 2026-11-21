@@ -10,7 +10,7 @@ public sealed record MicrosoftLoginOptions
     public const string DefaultAuthority = "https://login.microsoftonline.com/consumers/oauth2/v2.0/";
     public const string DefaultScope = "XboxLive.signin offline_access";
 
-    public required string ClientId { get; init; }
+    public string? ClientId { get; init; }
     public Uri Authority { get; init; } = new(DefaultAuthority);
     public string Scope { get; init; } = DefaultScope;
     public string? UserAgent { get; init; }
