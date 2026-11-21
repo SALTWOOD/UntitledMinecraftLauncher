@@ -150,7 +150,9 @@ internal static class Program
                       or InvalidOperationException
                       or OperationCanceledException)
         {
-            Error(exception.Message);
+            Error(exception is AuthenticationException
+                ? exception.Message
+                : exception.GetBaseException().Message);
             return 1;
         }
     }
